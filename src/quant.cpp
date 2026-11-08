@@ -1078,8 +1078,29 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
         return ok.load();
     }
     if(f.encoding==Encoding::q8_0 && scale==1.0f && zen::cpu_has_avx2_fma()) {
+        static const bool q8_act_enabled=[](){const char* e=std::getenv("ZEN_CPU_Q8_ACT");return e&&e[0]=='1';}();
         g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         zen::ResourceGovernor governor;const unsigned workers=requested_workers?requested_workers:governor.current_policy().worker_threads;
+        if(q8_act_enabled){
+            // Q is shared by every output row. Quantise it once on the caller,
+            // then let each row worker reuse the same compact int8 vector and
+            // per-block scales rather than repeating that O(K) pass per worker.
+            thread_local std::vector<std::int8_t> q;
+            thread_local std::vector<float> scales;
+            q.resize(cols);
+            scales.resize(cols/32);
+            if(!zen::quantise_acts_q8_0_avx2(x,cols,q.data(),scales.data()))return false;
+            const auto* const q_data=q.data();
+            const auto* const scale_data=scales.data();
+            const unsigned count=(rows>=128&&workers>1)?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
+            if(count==1)return zen::gemv_q8_0_avx2_int8_prequantised(w,q_data,scale_data,y,rows,cols);
+            std::atomic<bool> success{true};
+            zen::ComputePool::instance().parallel_for(rows,count,[&,q_data,scale_data](std::size_t first,std::size_t last){
+                if(!zen::gemv_q8_0_avx2_int8_prequantised(w+first*rb,q_data,scale_data,y+first,last-first,cols))
+                    success.store(false,std::memory_order_relaxed);
+            });
+            return success.load();
+        }
         if(rows>=128&&workers>1){
             const unsigned count=std::min<unsigned>(workers,static_cast<unsigned>(rows));
             std::atomic<bool> success{true};

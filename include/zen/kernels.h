@@ -26,6 +26,14 @@ void gemm_avx2(const float* a, const float* b, float* c,
 // Fused GGML Q8_0 matrix-vector kernel. Rows must be block-aligned (K % 32 == 0).
 bool gemv_q8_0_avx2(const std::uint8_t* weights, const float* x, float* y,
                     std::size_t rows, std::size_t columns);
+// Q8_0 activation quantisation and GEMV split so a caller parallelising rows
+// can quantise the shared input once, then reuse it across all worker slices.
+bool quantise_acts_q8_0_avx2(const float* x, std::size_t columns,
+                             std::int8_t* quantised, float* scales) noexcept;
+bool gemv_q8_0_avx2_int8_prequantised(const std::uint8_t* weights,
+                                      const std::int8_t* quantised,
+                                      const float* scales, float* y,
+                                      std::size_t rows, std::size_t columns);
 // Explicit Q1_0/Q2_0, NVFP4 and current/legacy Q8_1 CPU kernels.
 bool gemv_new_quant_avx2(const std::uint8_t*, const float*, float*, std::size_t, std::size_t, NewQuantKind);
 bool gemm_q1_0_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);

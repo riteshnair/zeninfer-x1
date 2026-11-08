@@ -3149,8 +3149,10 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         std::atomic<bool> attn_ok{true};
         zen::ResourceGovernor attn_gov;
         const unsigned attn_workers=attn_gov.current_policy().worker_threads;
-        // Tiled CPU attention (llama path only; Q35 stays scalar). Env gate
-        // ZEN_CPU_ATTN_TILED=1, default off. Query-block tiling with online
+        // Tiled CPU attention (llama path only; Q35 stays scalar). Long
+        // prefills (T >= 256) use query-block tiling by default; set
+        // ZEN_CPU_ATTN_TILED=0 to force the baseline, or =1 to force tiling
+        // for short prompts. Query-block tiling with online
         // softmax: (block,head) tasks stream KV tiles once across the query
         // block (K/V row loaded once per (tile,j), reused for QB queries from
         // L1/L2), instead of the baseline which rescans all KV per query and
@@ -3161,7 +3163,8 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         // float exp/scores/intermediate as baseline (online rescale differs
         // only in summation order, well within tolerance).
         // QB/KB default 32/32 (env ZEN_CPU_ATTN_QB/KB override, 1..128).
-        static const bool attn_tiled=[](){const char*e=std::getenv("ZEN_CPU_ATTN_TILED");return e&&e[0]=='1';}();
+        static const int attn_tiled_override=[](){const char*e=std::getenv("ZEN_CPU_ATTN_TILED");return e&&e[0]=='0'?0:(e&&e[0]=='1'?1:-1);}();
+        const bool attn_tiled=attn_tiled_override>=0?attn_tiled_override==1:T>=256;
         static const std::size_t attn_qb=[](){const char*e=std::getenv("ZEN_CPU_ATTN_QB");if(e){int v=std::atoi(e);if(v>=1&&v<=128)return static_cast<std::size_t>(v);}return std::size_t(32);}();
         static const std::size_t attn_kb=[](){const char*e=std::getenv("ZEN_CPU_ATTN_KB");if(e){int v=std::atoi(e);if(v>=1&&v<=128)return static_cast<std::size_t>(v);}return std::size_t(32);}();
         const std::size_t QB=attn_qb,KB=attn_kb;
