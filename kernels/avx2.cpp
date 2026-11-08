@@ -498,43 +498,68 @@ bool gemv_tq2_avx2(const std::uint8_t* weights, const float* x, float* y,
 }
 
 // Quantise one activation vector to Q8_0 form: 32 int8 per block plus a scale.
-// Used only by the opt-in int8 path below.
-static void quantise_acts_q8_0(const float* x, std::size_t columns,
-                               std::vector<std::int8_t>& q, std::vector<float>& sc) {
-    const std::size_t blocks = columns / 32;
-    q.resize(blocks * 32);
-    sc.resize(blocks);
-    for (std::size_t b = 0; b < blocks; ++b) {
+// AVX2 finds each block maximum and performs scale, clamp, and round in SIMD;
+// the small lane-store loop only narrows the 32 already-rounded values.
+bool quantise_acts_q8_0_avx2(const float* x, std::size_t columns,
+                             std::int8_t* quantised, float* scales) noexcept {
+    if (!x || !quantised || !scales || !columns || columns % 32) return false;
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    for (std::size_t b = 0; b < columns / 32; ++b) {
         const float* xb = x + b * 32;
-        float amax = 0.0f;
-        for (unsigned i = 0; i < 32; ++i) {
-            const float a = std::fabs(xb[i]);
-            amax = a > amax ? a : amax;
+        __m256 vmax = zero;
+        for (unsigned c = 0; c < 4; ++c) {
+            const __m256 v = _mm256_loadu_ps(xb + c * 8);
+            vmax = _mm256_max_ps(vmax, _mm256_and_ps(v, abs_mask));
         }
+        __m128 m = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+        m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+        m = _mm_max_ss(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1, 1, 1, 1)));
+        const float amax = _mm_cvtss_f32(m);
         const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
         const float inv = d > 0.0f ? 1.0f / d : 0.0f;
-        sc[b] = d;
-        std::int8_t* qb = q.data() + b * 32;
-        for (unsigned i = 0; i < 32; ++i) {
-            float v = xb[i] * inv;
-            v = v > 127.0f ? 127.0f : (v < -127.0f ? -127.0f : v);
-            qb[i] = static_cast<std::int8_t>(std::lround(v));
+        scales[b] = d;
+        __m256i qv[4];
+        for (unsigned c = 0; c < 4; ++c) {
+            __m256 v = _mm256_mul_ps(_mm256_loadu_ps(xb + c * 8), _mm256_set1_ps(inv));
+            v = _mm256_max_ps(_mm256_set1_ps(-127.0f), _mm256_min_ps(v, _mm256_set1_ps(127.0f)));
+            const __m256 magnitude = _mm256_andnot_ps(sign_mask, v);
+            __m256 rounded = _mm256_floor_ps(_mm256_add_ps(magnitude, _mm256_set1_ps(0.5f)));
+            rounded = _mm256_blendv_ps(rounded, _mm256_sub_ps(zero, rounded),
+                                       _mm256_cmp_ps(v, zero, _CMP_LT_OQ));
+            qv[c] = _mm256_cvtps_epi32(rounded);
         }
+        // Pack 32 int32 lanes to bytes without scalar narrowing. The two
+        // 128-bit pack steps keep each 8-value chunk in input order.
+        const __m128i q0lo = _mm256_castsi256_si128(qv[0]);
+        const __m128i q0hi = _mm256_extracti128_si256(qv[0], 1);
+        const __m128i q1lo = _mm256_castsi256_si128(qv[1]);
+        const __m128i q1hi = _mm256_extracti128_si256(qv[1], 1);
+        const __m128i q2lo = _mm256_castsi256_si128(qv[2]);
+        const __m128i q2hi = _mm256_extracti128_si256(qv[2], 1);
+        const __m128i q3lo = _mm256_castsi256_si128(qv[3]);
+        const __m128i q3hi = _mm256_extracti128_si256(qv[3], 1);
+        const __m128i b01 = _mm_packs_epi16(_mm_packs_epi32(q0lo, q0hi),
+                                             _mm_packs_epi32(q1lo, q1hi));
+        const __m128i b23 = _mm_packs_epi16(_mm_packs_epi32(q2lo, q2hi),
+                                             _mm_packs_epi32(q3lo, q3hi));
+        const __m256i packed = _mm256_inserti128_si256(_mm256_castsi128_si256(b01), b23, 1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(quantised + b * 32), packed);
     }
+    return true;
 }
 
 // int8 x int8 dot per block, 32 MACs in five instructions (two sign, maddubs,
 // madd, convert). This is llama.cpp's non-VNNI AVX2 formulation; this CPU is Zen 3,
 // so there is no _mm256_dpbusd_epi32 to use instead.
-// Opt-in: quantising the activations changes the arithmetic, so the exact fp32
-// path below stays the default and the parity tests keep covering it.
-static bool gemv_q8_0_avx2_int8(const std::uint8_t* weights, const float* x, float* y,
-                                std::size_t rows, std::size_t columns) {
+// Activation quantisation changes the arithmetic, so this path remains opt-in.
+bool gemv_q8_0_avx2_int8_prequantised(const std::uint8_t* weights,
+                                      const std::int8_t* xq, const float* xsc,
+                                      float* y, std::size_t rows,
+                                      std::size_t columns) {
+    if (!weights || !xq || !xsc || !y || !rows || !columns || columns % 32) return false;
     const std::size_t blocks = columns / 32, row_bytes = blocks * 34;
-    thread_local std::vector<std::int8_t> xq;
-    thread_local std::vector<float> xsc;
-    quantise_acts_q8_0(x, columns, xq, xsc);
-
     for (std::size_t r = 0; r < rows; ++r) {
         const std::uint8_t* row = weights + r * row_bytes;
         __m256 acc = _mm256_setzero_ps();
@@ -542,7 +567,7 @@ static bool gemv_q8_0_avx2_int8(const std::uint8_t* weights, const float* x, flo
             const std::uint8_t* p = row + b * 34;
             const float d = q8_half_to_float(std::uint16_t(p[0]) | (std::uint16_t(p[1]) << 8)) * xsc[b];
             const __m256i qw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 2));
-            const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq.data() + b * 32));
+            const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + b * 32));
             // |w| * (a * sign(w)) == w * a, in the unsigned-x-signed form maddubs
             // needs. |w| <= 128 and |a| <= 127, so a pair sum stays under 32767 and
             // the int16 intermediate cannot saturate.
@@ -555,6 +580,16 @@ static bool gemv_q8_0_avx2_int8(const std::uint8_t* weights, const float* x, flo
         y[r] = hsum_ps256(acc);
     }
     return true;
+}
+
+static bool gemv_q8_0_avx2_int8(const std::uint8_t* weights, const float* x, float* y,
+                                std::size_t rows, std::size_t columns) {
+    thread_local std::vector<std::int8_t> xq;
+    thread_local std::vector<float> xsc;
+    xq.resize(columns);
+    xsc.resize(columns / 32);
+    if (!quantise_acts_q8_0_avx2(x, columns, xq.data(), xsc.data())) return false;
+    return gemv_q8_0_avx2_int8_prequantised(weights, xq.data(), xsc.data(), y, rows, columns);
 }
 
 bool gemv_q8_0_avx2(const std::uint8_t* weights,const float* x,float* y,
