@@ -1,10 +1,13 @@
 # Benchmarks
 
-Measured 2026-11-08 on AMD Ryzen 9 5900XT (16 cores / 32 threads, 3.3 GHz,
-DDR4 ≈ 51 GB/s peak) and AMD Radeon RX 9070 XT (RDNA4, GDDR6 ≈ 614 GB/s,
-D3D12.1, ReBAR live). All runs use `zen_sherlock model.gguf 32 8`
-(prefill 32 tokens, decode 8 tokens) unless noted; `zen_generate_ids`
-cold-start numbers include one-off VRAM upload (~4.3 GB ≈ 675 ms on this box).
+Measured 2026-11-08 at source revision
+[`45c813f897b25e4aadbce87e38d81e8b62014529`](https://github.com/riteshnair/zeninfer-x1/commit/45c813f897b25e4aadbce87e38d81e8b62014529)
+on AMD Ryzen 9 5900XT (16 cores / 32 threads, 3.3 GHz, DDR4 ≈ 51 GB/s peak)
+and AMD Radeon RX 9070 XT (RDNA4, GDDR6 ≈ 614 GB/s, D3D12.1, ReBAR live).
+Unless noted, runs use `zen_sherlock model.gguf 32 8` (prefill 32 tokens,
+decode 8 tokens); `zen_generate_ids` cold-start numbers include one-off VRAM
+upload (~4.3 GB ≈ 675 ms on this box). These measurements describe that exact
+revision; rerun benchmarks after changing code.
 
 `zen_sherlock` warms the model once (page cache + VRAM residency) before
 measuring, so its prefill number is the steady-state figure. Its decode wall
@@ -28,6 +31,24 @@ gpu_ok=N` / `cpu_avx2=N` at exit.
 | GLM-4.7-Flash Q4_K_M | CPU / GPU | 7665 / 7660 ms · 4.2 tok/s | 1456 / 1415 ms/token · 0.7 tok/s |
 | K2-Horizon-36B MoVA Q4_K_M | CPU / GPU | 6300 / 5984 ms · 5 tok/s | 1164 / 1132 ms/token · 0.9 tok/s |
 | flint-q4_1 (MoE 256 experts) | CPU | 9866 ms / 8 tokens · 0.8 tok/s | ~203 ms/token · 4.9 tok/s |
+
+## Prefill scaling (Qwen3-4B Q8_0, warm)
+
+The following runs vary prompt length; unlike the standard 32-token measurements
+above, the 512-token rows use `zen_sherlock model.gguf 512 2`. CPU/GPU figures
+are from the 2026-11-08 audit at the pinned revision above.
+
+| Prompt tokens | Backend / mode | Prefill | Notes |
+|---:|---|---:|---|
+| 32 | CPU (`ZEN_BACKEND=cpu`) | 211 ms · 151 tok/s | |
+| 32 | GPU (default) | 116 ms · 276 tok/s | |
+| 512 | CPU (`ZEN_BACKEND=cpu`) | 131 tok/s | Elapsed time not recorded in the audit |
+| 512 | GPU (default) | 876 ms · 585 tok/s | |
+| 512 | GPU (`ZEN_D3D12_GEMM_I8=1`) | 213 ms · 2,404 tok/s | Experimental opt-in; token IDs matched this run, but the kernel's reported relative error is ≈1.6e-3, above the parity bar. Not the default. |
+
+The I8 result is a performance/accuracy tradeoff, not an apples-to-apples
+quality-preserving default. Route counters do not cover fused prefill paths;
+use the timings above rather than `quant::gemm` counters to compare these runs.
 
 ## Cold start (`zen_generate_ids`, first run)
 
